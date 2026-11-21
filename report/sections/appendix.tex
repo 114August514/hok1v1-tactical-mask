@@ -1,0 +1,129 @@
+% 主旨：给出平台任务编号对照、云端迁移中解决的工程问题与复现入口，正文不再出现这些细节。
+\section{实验记录与复现}
+\label{sec:appendix}
+
+\subsection{平台任务编号}
+
+\begin{table}[htbp]
+  \centering
+  \caption{正文配置与开悟平台任务的对应关系}
+  \label{tab:task-ids}
+  \begin{tabularx}{\linewidth}{llX}
+    \toprule
+    配置 & 平台任务 & 备注 \\
+    \midrule
+    基线 & \texttt{\#472732} & 平台官方配置，适配 V63.0.9 英雄字段 \\
+    仅奖励 & \texttt{\#523716} & \texttt{USE\_TACTICAL\_MASK = False} \\
+    仅掩码 & \texttt{\#523939} & 奖励只保留外塔项，权重 \num{1.0} \\
+    完整 & \texttt{\#523898} & 当前代码，未改配置 \\
+    完整（旧规则） & \texttt{\#474124} & 终点为第 \num{598} 步，提交为模型 \texttt{\#556786} \\
+    续训 & \texttt{\#475110} & 自 \texttt{\#556786} 出发，终点为第 \num{1793} 步，提交为模型 \texttt{\#556993} \\
+    模型对战 & \texttt{\#842359} & 对局编号 19583882、19583894、19583914、19583926、19583972、19584009 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+每个训练任务的代码都可在平台上下载快照。据快照核对：仅奖励、仅掩码、完整三组只有 \path{conf/conf.py} 不同；基线与本文使用同一网络结构和同一 PPO 损失实现（含 LSTM、价值损失与双裁剪策略损失），差别在于没有战术掩码与冷启动偏置、只用外塔奖励、熵项不按分支缩放，以及学习率与熵系数不同（\cref{sec:setup}）。
+
+\subsection{云端适配中的工程问题}
+
+离线引擎与云端平台的接口不同，迁移时处理了四个问题。（1）红方方向：V63.0.9 会把红方提交的离散方向取反，未修正时红方被推进走廊推回泉水，一次早期运行因此在 \qty{8}{\minute} 时终止；修正后在红方实测 \num{900} 帧确认方向正确。（2）观测下标：离线 \num{705} 维向量的含义来自公开旧版接口\cite{hoksource}，用单方向连续移动的探针核对后发现部分下标不能稳定反映位置，因此所有距离改由原始帧坐标计算。（3）采样数值：概率按 \texttt{float32} 累加时偶发超过 \num{1}，导致多项分布采样报错，改为 \texttt{float64} 归一化后按累积分布二分查找。（4）前向一致性：离线采样端用 NumPy 推理、集群用 PyTorch 更新，同一权重下两者输出的最大绝对误差为 \num{2.7e-6}。
+
+\subsection{关键代码}
+\label{sec:code}
+
+本节节选实现一致性掩码的四段代码，略去了日志、迷雾记忆的更新与闪现引导等细节；代码清单中的注释为说明而补写。除 \path{tactical_mask.py} 外，其余三段所在的文件属于开悟平台基线框架（版权归腾讯），这里只摘录与掩码相关的几行。掩码在观测处理阶段注入（\cref{lst:inject}），因此训练采样与评估决策读到的是同一个过滤后的合法动作向量。
+
+\begin{lstlisting}[language=Python,caption={掩码注入：\texttt{agent.py} 中的观测处理},label={lst:inject}]
+def observation_process(self, observation):
+    feature = self.feature_processes.process_feature(observation)
+    legal_action = observation["legal_action"]          # 环境给出的 184 维合法动作
+    if getattr(GameConfig, "USE_TACTICAL_MASK", False):
+        legal_action = apply_tactical_mask(              # 只会把 1 改成 0
+            legal_action,
+            observation.get("frame_state"),
+            self.hero_camp,
+            memory=self.tactical_memory,                 # 局内记忆：建筑位置、近几步血量、回泉状态
+        )
+    return ObsData(feature=feature, legal_action=legal_action,
+                   lstm_cell=self.lstm_cell, lstm_hidden=self.lstm_hidden)
+\end{lstlisting}
+
+\cref{lst:mask} 是 \cref{tab:mask-rules} 中射程门控、撤退、受压选敌、补给与推进走廊的实现。\texttt{btn} 为按钮掩码，\texttt{target\_mat} 为按按钮分行的 $12\times9$ 目标掩码，\texttt{refined} 与 \texttt{raw} 分别为过滤后与原始的合法动作向量。为便于阅读，走廊开启条件与补给目标方向的计算合并成了 \texttt{corridor\_open} 和 \texttt{unit\_towards} 两个示意函数，源码中它们是展开的条件判断。
+
+\begin{lstlisting}[language=Python,caption={战术掩码主体：\texttt{tactical\_mask.py} 节选},label={lst:mask}]
+for idle_b in (BUTTON_NONE_0, BUTTON_NONE_1, BUTTON_RECALL):
+    btn[idle_b] = 0.0                                  # 屏蔽空动作与回城
+if state["main_hp_ratio"] >= HEAL_HP_THRESHOLD:        # 0.85
+    btn[BUTTON_HEAL] = 0.0
+
+nearest = state["nearest_target_dist"]                 # 射程门控
+if nearest > ATTACK_RADIUS: btn[BUTTON_ATTACK] = 0.0   # 7500
+if nearest > SKILL_RADIUS:                             # 8500
+    btn[BUTTON_SKILL1] = btn[BUTTON_SKILL3] = 0.0
+if nearest > SKILL2_RADIUS: btn[BUTTON_SKILL2] = 0.0   # 15000
+
+if _needs_combat_retreat(state):                       # 低血撤退与塔下避险
+    for off_b in OFFENSE_BUTTONS:
+        btn[off_b] = 0.0
+        target_mat[off_b, TARGET_ENEMY_HERO] = 0.0
+        target_mat[off_b, TARGET_TOWER] = 0.0
+
+if hero_pressure:                                      # 受压选敌
+    if state["enemy_hero_dist"] <= ATTACK_RADIUS:
+        for off_b in OFFENSE_BUTTONS:
+            target_mat[off_b, NON_HERO_TARGETS] = 0.0
+    else:
+        btn[BUTTON_ATTACK] = 0.0
+
+rec_mode = _latch_home(state, _recovery_mode(state), memory)
+if rec_mode in ("cake", "fountain"):                   # 补给：方向锁向血包或泉水
+    _lock_move_bins(refined, raw, *unit_towards(rec_mode))
+elif corridor_open(state) and state["dist_to_target_organ"] > stop_dist:
+    unit = _world_delta_to_action_unit(                # 红方方向乘以 -1
+        state["main_pos"], state["target_organ_pos"], main_camp)
+    _lock_move_bins(refined, raw, unit[0], unit[1])    # 推进走廊
+
+if btn.sum() <= 0.0:                                   # 保证掩码非空
+    btn[BUTTON_MOVE] = raw_btn[BUTTON_MOVE]
+\end{lstlisting}
+
+采样端把被掩去动作的对数几率减去一个极大常数后再做 softmax（\cref{lst:sample}），被掩去动作的概率因此为零，记录下的概率就是实际行为的概率。
+
+\begin{lstlisting}[language=Python,caption={带掩码的 softmax：\texttt{agent.py}},label={lst:sample}]
+def _legal_soft_max(self, input_hidden, legal_action):
+    w, e = 1e20, 1e-5
+    x = np.asarray(input_hidden, dtype=np.float64)
+    m = np.asarray(legal_action, dtype=np.float64)
+    x = x - w * (1.0 - m)                               # 被掩去的动作减去极大常数
+    x = np.clip(x - np.max(x), -w, 1.0)
+    x = (np.exp(x) + e) * m                             # 平滑常数只加在合法动作上
+    return x / np.sum(x)
+\end{lstlisting}
+
+学习端从样本中取出保存的 \num{85} 维掩码，用同样的方式归一化新策略，再与记录的旧概率求比率并做双裁剪（\cref{lst:loss}），对应 \cref{eq:head-ratio,eq:head-ppo}。
+
+\begin{lstlisting}[language=Python,caption={损失中的掩码与双裁剪：\texttt{model.py} 节选},label={lst:loss}]
+legal_mask = legal_action_flag_list[k] > 0             # 样本中保存的掩码
+masked = logits.masked_fill(~legal_mask, torch.finfo(logits.dtype).min)
+exp = (torch.exp(masked - masked.max(dim=1, keepdim=True).values)
+       + self.min_policy) * legal_mask
+prob = exp / exp.sum(dim=1, keepdim=True).clamp_min(eps)
+
+policy_p = (one_hot_actions * prob).sum(dim=1).clamp_min(eps)
+old_p = (one_hot_actions * old_prob[k]).sum(dim=1).clamp_min(eps)
+ratio = torch.exp(torch.log(policy_p) - torch.log(old_p))
+surr1 = ratio.clamp(0.0, 3.0) * advantage               # 比率上界 3
+surr2 = ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param) * advantage
+w = weight_list[k] * train_mask                         # 分支生效且英雄存活
+loss_k = -torch.sum(torch.minimum(surr1, surr2) * w) / w.sum().clamp_min(1.0)
+\end{lstlisting}
+
+\subsection{复现入口}
+
+战术掩码实现在 \path{agent_ppo/feature/tactical_mask.py}，可直接放入平台基线的同名目录；奖励项、冷启动偏置与分支熵缩放写在平台基线的 \path{reward_process.py}、\path{model.py} 中，\path{conf.py} 里的 \texttt{USE\_TACTICAL\_MASK} 与 \texttt{REWARD\_WEIGHT\_DICT} 即消融开关。云端监控序列保存在 \path{results/cloud_metrics/}，\path{analysis/report.py} 据此与 \path{results/experiment_summary.json} 生成文中各图。在项目目录执行 \cref{lst:repro} 可重新生成图并编译本文。
+
+\begin{lstlisting}[language=bash,caption={生成图表并编译},label={lst:repro}]
+uv run python analysis/report.py
+make -C report
+\end{lstlisting}

@@ -1,0 +1,113 @@
+% 主旨：在平台 PPO 基线（实体编码 + LSTM）上，战术规则以采样前掩码进入条件策略，
+%       相当于用先验知识缩小策略类；另加混合塑形奖励与按钮头冷启动偏置。
+\section{方法}
+\label{sec:method}
+
+方法由平台基线与三处改动组成（\cref{fig:system-arch}）：网络、优化器和分布式流程沿用平台 PPO 基线（\cref{sec:base}）；战术规则在观测处理阶段写入合法动作掩码（\cref{sec:tactical-mask}）；奖励改为混合塑形（\cref{sec:reward}），按钮头加入冷启动偏置（\cref{sec:prior}）。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.98\linewidth]{system_arch.pdf}
+  \caption{策略价值网络与共享战术掩码。(a) 实体编码与 LSTM 共同给出六个动作分支和状态价值；(b) 战术掩码在采样前过滤合法动作，过滤结果随样本保存并在 PPO 更新中复用。}
+  \label{fig:system-arch}
+\end{figure}
+
+\subsection{平台基线}
+\label{sec:base}
+
+网络先按实体编码：双方英雄经共享多层感知机映射为 \num{128} 维，小兵与建筑经权重共享的编码器后沿槽位取最大池化，各得 \num{32} 维。拼接后的 \num{384} 维向量经全连接层送入隐藏维数为 \num{512} 的单层 LSTM，输出 $z_t$ 经五个线性头给出按钮与四个方向分支的对数几率；目标分支以 $z_t$ 生成查询向量，与 \num{9} 个候选目标的嵌入做点积注意力\cite{ye2020mastering}。独立价值头输出 $V_\phi(z_t)$。全网参数 \num{2638701} 个，其中 LSTM 占 \qty{79.6}{\percent}。
+
+训练采用异步的采样—学习流水线。每局结束后按广义优势估计（generalized advantage estimation, GAE）\cite{gae2016}逆序计算优势与价值目标：
+\begin{equation}
+  \delta_t=r_t+\gamma V_\phi(z_{t+1})-V_\phi(z_t),\qquad
+  \widehat A_t=\delta_t+\gamma\lambda\widehat A_{t+1},\qquad
+  \widehat V_t=\widehat A_t+V_\phi(z_t),
+  \label{eq:gae}
+\end{equation}
+\cref{eq:gae} 中 $\gamma=0.995$、$\lambda=0.95$，终局 $V_\phi(z_{T+1})=0$。样本以 \num{16} 步片段存入容量 \num{5000} 的回放池，凑满批大小 \num{1024} 后更新。记 $\alpha_t\in\{0,1\}$ 为英雄存活指示，各分支的损失权重 $w_t^{(k)}=q_t^{(k)}\alpha_t$。策略损失在每个分支上分别计算重要性比率与裁剪目标\cite{ppo2017,ye2020mastering}：
+\begin{align}
+  \rho_t^{(k)}(\theta)&=\frac{\pi_\theta^{(k)}(a_t^{(k)}\mid z_t,a_t^{(<k)},m_t)}{\pi_{\theta\subtext{old}}^{(k)}(a_t^{(k)}\mid z_t,a_t^{(<k)},m_t)},
+  \label{eq:head-ratio}\\
+  L^{(k)}(\theta)&=-\frac{\sum_t w_t^{(k)}\min\bigl(\operatorname{clip}_{[0,3]}(\rho_t^{(k)})\widehat A_t,\ \operatorname{clip}_{[1-\epsilon,1+\epsilon]}(\rho_t^{(k)})\widehat A_t\bigr)}{\max\bigl(1,\sum_t w_t^{(k)}\bigr)},
+  \label{eq:head-ppo}\\
+  \mathcal L(\theta,\phi)&=\sum_{k=1}^{6}L^{(k)}(\theta)
+  +\frac{c\subtext{v}}{N}\sum_t\alpha_t\bigl(\widehat V_t-V_\phi(z_t)\bigr)^2
+  -\beta\sum_{k=1}^{6}\sigma_k\widehat{\mathcal H}^{(k)}(\theta).
+  \label{eq:loss}
+\end{align}
+\cref{eq:head-ppo} 中 $\epsilon=0.2$；$\operatorname{clip}_{[0,3]}$ 给比率加上界，对应双裁剪目标\cite{ye2020mastering}。\cref{eq:loss} 中 $N=\max(1,\sum_t\alpha_t)$，$c\subtext{v}=0.5$；$\widehat{\mathcal H}^{(k)}$ 为分支 $k$ 的掩码策略熵按 $w_t^{(k)}$ 加权的样本均值，分支缩放系数 $\sigma=(0.2,1,1,1,1,0.2)$，$\beta=0.015$，以降低按钮与目标分支的随机性、保留走位探索。优化器为 Adam，学习率在 \num{15000} 步内由 \num{5e-4} 线性降至 \num{1e-4}，梯度范数裁剪阈值为 \num{0.5}。
+
+\subsection{一致性战术掩码}
+\label{sec:tactical-mask}
+
+战术规则写成一个带局内记忆的函数：输入环境给出的 \num{184} 维合法向量 $\tilde m_t$、原始帧状态和局内记忆（建筑位置、近几步血量、回泉状态），输出过滤后的掩码 $m_t\le\tilde m_t$（逐元素）。它在观测处理阶段执行，早于任何一次采样，因此训练采样、评估决策和学习端的损失使用同一个 $m_t$。采样时记录掩码策略给出的动作概率，作为 $\pi_{\theta\subtext{old}}$；样本同时保存选定按钮对应的掩码，压缩为 $12+4\times16+9=85$ 维，学习端用它计算新策略概率，再与记录的旧概率求 \cref{eq:head-ratio} 的比率。关键代码见\cref{sec:code}。
+
+这一设计带来两点性质。第一，被掩去的动作在 \cref{eq:cond-policy-branch} 中概率为零，实际执行的动作必然来自策略分布，记录的旧概率就是真实行为概率，\cref{eq:head-ratio} 的比率有意义\cite{huang2022masking}。第二，新旧策略定义在同一动作支持集上，比率不会因为某个动作只在一方被掩去而趋于零或无穷。若改为采样后改写动作，被执行的动作在策略分布中的概率可能接近零（实现中只在归一化前给合法动作加 \num{1e-5} 的平滑常数），比率随之失控。为保证掩码非空，所有进攻按钮被屏蔽时保留移动按钮。
+
+从学习的角度看，掩码缩小了策略需要搜索的假设空间。记 $s$ 为观测与规则记忆的组合，$\mathcal M(s)$ 为规则在 $s$ 下允许的动作集合，带掩码的策略只能取自
+\begin{equation}
+  \Pi_{\mathcal M}=\bigl\{\pi:\ \pi(a\mid s)=0,\ \forall a\notin\mathcal M(s)\bigr\}\subset\Pi,
+  \label{eq:policy-class}
+\end{equation}
+其中 $\Pi$ 为不加掩码时 \cref{eq:cond-policy} 能表示的全部策略。缩小策略类是用偏差换取样本效率。在 $\Pi_{\mathcal M}$ 内，随机初始化的策略已经避开了空放技能、无目标游荡、残血恋战等明显不利的动作，探索预算集中在规则留下的选择上：打哪个目标、往哪个方向走位、何时放技能。有限的样本因此更可能在其中找到较好的策略。代价是，若最优动作被规则排除，$\Pi_{\mathcal M}$ 中最好的策略也达不到它，规则质量决定了性能上限。\cref{sec:ablation} 中“仅掩码”在训练开始时已有 \num{0.67} 的胜率、“完整”在 \qty{12}{\minute} 内升至 \num{1.00}，与这一分析相符。
+
+规则按鲁班七号的射程和 1v1 的对线节奏设定，分为五组（\cref{tab:mask-rules}）。迷雾中的建筑位置由局内记忆补全：首次看到外塔、水晶和己方泉水时记录坐标与损毁状态，未看到之前使用固定地图上的默认地标，并始终忽略哨兵坐标。距离一律用实体真实坐标计算。
+
+\begin{table}[htbp]
+  \centering
+  \caption{战术掩码规则（距离单位为游戏坐标，HP 为生命值比例）}
+  \label{tab:mask-rules}
+  \begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.15\linewidth}X>{\raggedright\arraybackslash}p{0.31\linewidth}}
+    \toprule
+    规则 & 触发条件 & 掩码作用 \\
+    \midrule
+    射程门控 & 英雄存活；最近敌方有效单位超出普攻（\num{7500}）、一/三技能（\num{8500}）或二技能（\num{15000}）射程；HP $\ge 0.85$ & 屏蔽对应按钮；屏蔽治疗；始终屏蔽空动作与回城 \\
+    撤退与塔下避险 & 敌塔锁定自身，或无己方小兵承受塔伤时进入敌塔 \num{8500} 内（塔下危险）；或敌方英雄在 \num{9000} 内且 HP $<0.28$，或 HP $<0.40$ 且落后敌方 \num{0.10} 以上 & 屏蔽全部进攻按钮及其英雄、敌塔目标。非塔下危险时，若敌方 HP $<0.28$、己方 HP $\ge0.16$ 且不低于敌方 HP 减 \num{0.10}，保留斩杀窗口 \\
+    受压选敌 & 敌方英雄在 \num{8000} 内可见、不处于塔下危险，且己方 HP 在最近 \num{3} 步内净下降 & 敌方英雄在 \num{7500} 内时，进攻按钮只能以英雄为目标；更远时屏蔽普攻 \\
+    补给滞回 & HP $<0.40$ 或处于撤退；沿途血包可达（距离 $\le16000$、HP $\ge0.24$、敌方英雄 $>6500$）时优先血包 & 移动方向锁定血包或泉水；HP $<0.40$ 时开始的回泉保持到 HP $\ge0.80$（己方外塔危急时 $0.65$），塔下撤离不触发保持 \\
+    推进走廊 & 非撤退、非补给，HP $\ge0.50$，且 \num{9500} 内无敌方英雄、\num{8000} 内无敌方小兵 & 距目标建筑超过 \num{8000}（有己方小兵抗塔）或 \num{9200}（无小兵）时锁定移动方向朝向目标；进入该距离后解除方向约束 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+两处细节决定规则能否在红方生效。V63.0.9 会把红方提交的离散方向取反，因此由世界坐标差换算方向栅格时，红方乘以符号因子 $-1$。闪现只在两种情形开放并锁定方向，其余时刻屏蔽：一是撤离，即被敌塔锁定且 HP $<0.65$、处于塔下危险且 HP $<0.55$，或 HP $<0.28$、敌方英雄在 \num{6000} 内且不满足斩杀条件；二是追击斩杀，即敌方 HP $<0.25$、己方 HP $\ge0.40$、不处于塔下危险且距离在 \numrange{6800}{11500} 之间。
+
+掩码只引入先验知识，不引入特权信息。它读取的是平台接口交给智能体的同一份观测（帧状态与合法动作），迷雾中的敌方单位保持不可见，建筑位置来自本方此前的观测或固定地图上的地标；它只改变本方策略的动作分布，不改动环境、对手或判胜规则。平台开发指南本身就用合法动作掩码屏蔽冷却中的技能，以减少无意义的探索\cite{kaiwu63}，\textcite{ye2020mastering} 也用游戏知识剪枝动作。本文沿用同一机制，把屏蔽范围从“不可执行”扩展到针对鲁班七号的“战术上不可取”。由于评估时掩码同样生效，报告的胜率属于“规则加学习”的整体策略（\cref{sec:limitations}）。
+
+\subsection{混合塑形奖励}
+\label{sec:reward}
+
+平台默认奖励只有外塔血量一项。本文的单步奖励为
+\begin{equation}
+  r_t=\operatorname{clip}_{[-100,100]}\Bigl(\sum_{i\in\mathcal I\subtext{diff}}\kappa_i\bigl[\Delta\phi_i\suptext{own}(t)-\Delta\phi_i\suptext{emy}(t)\bigr]+\sum_{j\in\mathcal I\subtext{own}}\kappa_j\,\psi_j(t)\Bigr),
+  \label{eq:reward}
+\end{equation}
+\cref{eq:reward} 中 $\Delta\phi_i(t)=\phi_i(t)-\phi_i(t-1)$，$\kappa$ 为权重。差分项 $\mathcal I\subtext{diff}$ 比较双方同一状态量的变化，单边项 $\mathcal I\subtext{own}$ 只针对己方行为，$\psi_j$ 为其单步取值；各项定义与权重见 \cref{tab:reward}。差分项形式上接近势函数差，但势函数塑形保证最优策略不变的条件是 $F=\gamma\Phi(s')-\Phi(s)$\cite{ng1999}；这里没有乘折扣 $\gamma$，部分状态量取历史最大值或在复活时重置，整体又经过裁剪，因此这套混合奖励不保证最优策略不变，只作为加速学习的启发信号。裁剪范围取 $\pm100$，使阵亡等大事件不被压平。
+
+\begin{table}[htbp]
+  \centering
+  \caption{奖励项与权重}
+  \label{tab:reward}
+  \begin{tabularx}{\linewidth}{llXr}
+    \toprule
+    奖励项 & 类型 & 定义 & 权重 \\
+    \midrule
+    外塔 & 差分 & 外塔 HP 比例的帧间变化 & \num{8.00} \\
+    水晶 & 差分 & 水晶 HP 比例的帧间变化 & \num{10.00} \\
+    英雄血量 & 差分 & 英雄 HP 比例的帧间变化，复活首帧重置 & \num{2.00} \\
+    击杀 & 差分 & 击杀数增量 & \num{1.00} \\
+    阵亡 & 差分 & 阵亡数增量 & \num{-1.20} \\
+    经济 & 差分 & 累计金币收入除以 \num{100} 的增量，不扣购买支出 & \num{0.06} \\
+    经验 & 差分 & 等级加 $\min(0.99,\ \text{经验}/1500)$ 的历史最大值的增量 & \num{0.20} \\
+    推进进度 & 单边 & 英雄向目标建筑的归一化推进进度（截断到 $[-1,0.8]$）的帧间变化；无己方小兵时在敌塔范围内取反；HP $<0.45$ 时不计负值 & \num{0.25} \\
+    补刀 & 单边 & 非击杀、非破塔帧金币增量 $\ge55$ 计 \num{1}，$\ge38$ 计 \num{0.5} & \num{0.20} \\
+    塔伤 & 单边 & 敌塔锁定自身且掉血时计 $-1$ & \num{0.25} \\
+    停滞 & 单边 & HP $\ge0.80$、远离目标且附近无敌军时计 $-1$ & \num{0.08} \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\subsection{冷启动偏置}
+\label{sec:prior}
+
+随机初始化时按钮分布接近均匀，攻击按钮被采到的概率低。冷启动时在按钮头输出层的偏置上为普攻、一技能、二技能、三技能分别加 $+0.85$、$+0.55$、$+0.60$、$+0.55$，提高早期交互中的攻击频率。该偏置只改变初始化，此后随训练更新。

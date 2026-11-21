@@ -1,0 +1,19 @@
+[project]
+name = "hok1v1-tactical-mask"
+version = "1.0.0"
+description = "Consistent tactical action masking for short-budget RL in Honor of Kings 1v1"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "matplotlib>=3.8",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

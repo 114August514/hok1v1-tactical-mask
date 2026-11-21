@@ -1,0 +1,19 @@
+# LaTeX 构建产物（report/main.pdf 保留，作为技术报告的发布版本）
+report/build/
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.run.xml
+*.synctex.gz
+*.xdv
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
